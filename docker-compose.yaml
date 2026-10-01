@@ -1,0 +1,15 @@
+services:
+  euserv-renew:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: euserv-renew:local-cache-safe
+    container_name: euserv-renew
+    restart: unless-stopped
+    env_file:
+      - ./config/private.env
+    environment:
+      RUN_MODE: loop
+      RUN_INTERVAL_SECONDS: 86400
+      RUN_ON_STARTUP: "true"
+      TZ: UTC
