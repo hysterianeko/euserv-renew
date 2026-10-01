@@ -1,9 +1,6 @@
 services:
   euserv-renew:
-    build:
-      context: .
-      dockerfile: Dockerfile
-    image: euserv-renew:local-cache-safe
+    image: circling0635/euserv-renew:2026.10.02
     container_name: euserv-renew
     restart: unless-stopped
     env_file:
