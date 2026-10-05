@@ -48,6 +48,15 @@ CHALLENGE_GATEWAY_KEY=replace_with_shared_gateway_key
 `CHALLENGE_GATEWAY_KEY` 必须和 challenge-gateway 服务器上的 `CLIENTT_KEY`
 完全一致。Telegram 配置是可选的；多个账号和密码使用空格分隔，并保持数量对应。
 
+注意：Docker Compose 会解析 `env_file` 中未加引号的 `$`。如果 EUserv 密码
+包含 `$`，请把整个密码值用单引号包起来，例如：
+
+```env
+PASSWORD='your_password_with_$ characters'
+```
+
+单引号可以保留密码中的 `$`；不要把真实的 `private.env` 上传到 GitHub 或 Docker Hub。
+
 ## Run
 
 ```bash
