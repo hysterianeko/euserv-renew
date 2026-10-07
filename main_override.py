@@ -9,12 +9,20 @@ otherwise plausible.
 """
 
 import base64
+import io
 import os
+import re
 import sys
 import time
 from urllib.parse import urlencode
 
 import main
+
+try:
+    from PIL import Image, ImageFilter
+except ImportError:  # pragma: no cover - the Docker image installs Pillow.
+    Image = None
+    ImageFilter = None
 
 
 CHALLENGE_GATEWAY_URL = os.environ.get(
@@ -27,13 +35,20 @@ CHALLENGE_GATEWAY_POLL_INTERVAL = float(
 CHALLENGE_GATEWAY_MAX_POLLS = int(
     os.environ.get("CHALLENGE_GATEWAY_MAX_POLLS", "90")
 )
+CAPTCHA_PREPROCESS_ENABLED = (
+    os.environ.get("CAPTCHA_PREPROCESS_ENABLED", "true").strip().lower() == "true"
+)
+CAPTCHA_MAX_CANDIDATES = max(
+    1, int(os.environ.get("CAPTCHA_MAX_CANDIDATES", "4"))
+)
 
 
-def captcha_solver(captcha_image_url: str, session):
+def fetch_captcha(captcha_image_url: str, session, sess_id: str | None = None) -> bytes:
+    """Fetch the image bound to the same EUserv session used for submission."""
+    current_sess_id = sess_id or session.cookies.get("PHPSESSID")
     query = [("_", str(time.time_ns()))]
-    sess_id = session.cookies.get("PHPSESSID")
-    if sess_id:
-        query.insert(0, ("sess_id", sess_id))
+    if current_sess_id:
+        query.insert(0, ("sess_id", current_sess_id))
     separator = "&" if "?" in captcha_image_url else "?"
     cache_busted_url = f"{captcha_image_url}{separator}{urlencode(query)}"
     headers = {
@@ -46,9 +61,40 @@ def captcha_solver(captcha_image_url: str, session):
     response.raise_for_status()
     if not response.content:
         raise ValueError("EUserv returned an empty CAPTCHA image.")
+    return response.content
 
-    encoded_image = base64.b64encode(response.content).decode()
-    provider = main.get_captcha_provider()
+
+def preprocess_captcha(image_bytes: bytes) -> bytes:
+    """Remove small orange specks before a second OCR attempt.
+
+    EUserv uses orange text and draws thin orange interference over it. A
+    small morphological opening keeps the thicker glyphs while removing much
+    of the dot noise. The original image remains the first candidate.
+    """
+    if Image is None or ImageFilter is None:
+        raise RuntimeError("Pillow is required for CAPTCHA preprocessing.")
+
+    image = Image.open(io.BytesIO(image_bytes)).convert("RGB")
+    pixels = []
+    for red, green, blue in image.getdata():
+        is_orange = red - green > 45 and red - blue > 45 and green < 220
+        pixels.append(0 if is_orange else 255)
+
+    mask = Image.new("L", image.size)
+    mask.putdata(pixels)
+    opened = mask.filter(ImageFilter.MaxFilter(3)).filter(ImageFilter.MinFilter(3))
+    width, height = opened.size
+    top = max(0, round(height * 0.14))
+    bottom = min(height, round(height * 0.82))
+    cropped = opened.crop((0, top, width, bottom))
+    scaled = cropped.resize((width * 4, (bottom - top) * 4), Image.Resampling.NEAREST)
+
+    output = io.BytesIO()
+    scaled.save(output, format="PNG")
+    return output.getvalue()
+
+
+def solve_encoded_image(encoded_image: str, provider: str) -> dict:
     if provider == "capsolver":
         return main.capsolver_solver(encoded_image)
     if provider in {"challenge", "challenge-gateway", "challenge_gateway", "gateway"}:
@@ -56,6 +102,77 @@ def captcha_solver(captcha_image_url: str, session):
     if provider == "truecaptcha":
         return main.truecaptcha_solver(encoded_image)
     raise ValueError(f"Unsupported captcha provider: {provider}")
+
+
+def result_to_code(solved: dict) -> str:
+    return result_to_candidates(solved)[0]
+
+
+def result_to_candidates(solved: dict) -> list[str]:
+    if solved.get("errorId", 0) != 0:
+        raise ValueError(
+            solved.get("errorDescription") or solved.get("errorCode") or "CAPTCHA solver failed."
+        )
+
+    solution = solved.get("solution") or {}
+    raw_values = [solution.get("text")]
+    alternatives = solution.get("alternatives") or []
+    if isinstance(alternatives, list):
+        raw_values.extend(alternatives)
+
+    candidates = []
+    for raw_value in raw_values:
+        text = re.sub(r"\s+", "", str(raw_value or "")).strip()
+        if not text:
+            continue
+        code = str(main.normalize_captcha_text(text))
+        if code not in candidates:
+            candidates.append(code)
+
+    if not candidates:
+        raise ValueError("CAPTCHA solver returned an empty result.")
+    return candidates
+
+
+def captcha_candidates(captcha_image_url: str, session, sess_id: str):
+    """Return the original OCR result plus one noise-reduced fallback."""
+    image_bytes = fetch_captcha(captcha_image_url, session, sess_id)
+    provider = main.get_captcha_provider()
+    encoded_image = base64.b64encode(image_bytes).decode()
+    candidates = []
+
+    solved = solve_encoded_image(encoded_image, provider)
+    for index, code in enumerate(result_to_candidates(solved)):
+        if len(candidates) >= CAPTCHA_MAX_CANDIDATES:
+            break
+        label = provider if index == 0 else f"{provider}+alternative-{index}"
+        candidates.append((label, code))
+
+    if (
+        CAPTCHA_PREPROCESS_ENABLED
+        and provider in {"challenge", "challenge-gateway", "challenge_gateway", "gateway"}
+        and len(candidates) < CAPTCHA_MAX_CANDIDATES
+    ):
+        processed = preprocess_captcha(image_bytes)
+        processed_result = solve_encoded_image(
+            base64.b64encode(processed).decode(), provider
+        )
+        for index, processed_code in enumerate(result_to_candidates(processed_result)):
+            if len(candidates) >= CAPTCHA_MAX_CANDIDATES:
+                break
+            if processed_code in {code for _, code in candidates}:
+                continue
+            suffix = "preprocessed" if index == 0 else f"preprocessed-{index}"
+            candidates.append((f"{provider}+{suffix}", processed_code))
+
+    return candidates
+
+
+def captcha_solver(captcha_image_url: str, session):
+    """Keep the upstream-compatible single-result solver available."""
+    image_bytes = fetch_captcha(captcha_image_url, session)
+    provider = main.get_captcha_provider()
+    return solve_encoded_image(base64.b64encode(image_bytes).decode(), provider)
 
 
 def challenge_gateway_solver(encoded_image: str) -> dict:
@@ -108,7 +225,17 @@ def challenge_gateway_solver(encoded_image: str) -> dict:
             text = str(solution.get("text") or "").strip()
             if not text:
                 raise ValueError("Challenge gateway returned an empty OCR result.")
-            return {"errorId": 0, "taskId": task_id, "solution": {"text": text}}
+            alternatives = solution.get("alternatives") or []
+            if not isinstance(alternatives, list):
+                alternatives = []
+            return {
+                "errorId": 0,
+                "taskId": task_id,
+                "solution": {
+                    "text": text,
+                    "alternatives": [str(value) for value in alternatives if value],
+                },
+            }
         if status in {"failed", "error"}:
             raise ValueError("Challenge gateway OCR task failed.")
         time.sleep(CHALLENGE_GATEWAY_POLL_INTERVAL)
@@ -116,10 +243,108 @@ def challenge_gateway_solver(encoded_image: str) -> dict:
     raise TimeoutError("Challenge gateway OCR task timed out.")
 
 
+def login_once(username: str, password: str):
+    """Attempt one login and try both OCR candidates on the same session."""
+    headers = {"user-agent": main.user_agent, "origin": "https://www.euserv.com"}
+    url = "https://support.euserv.com/index.iphp"
+    captcha_image_url = "https://support.euserv.com/securimage_show.php"
+    session = main.requests.Session()
+
+    initial = session.get(url, headers=headers, timeout=30)
+    initial.raise_for_status()
+    sess_match = re.findall(r"PHPSESSID=(\w{10,100});", str(initial.headers))
+    sess_id = sess_match[0] if sess_match else session.cookies.get("PHPSESSID")
+    if not sess_id:
+        raise ValueError("EUserv did not return a PHP session id.")
+
+    session.get(
+        "https://support.euserv.com/pic/logo_small.png",
+        headers=headers,
+        timeout=30,
+    )
+    first = session.post(
+        url,
+        headers=headers,
+        data={
+            "email": username,
+            "password": password,
+            "form_selected_language": "en",
+            "Submit": "Login",
+            "subaction": "login",
+            "sess_id": sess_id,
+        },
+        timeout=30,
+    )
+    first.raise_for_status()
+
+    success_markers = (
+        "Hello" in first.text
+        or "Confirm or change your customer data here" in first.text
+    )
+    captcha_marker = "To finish the login process please solve the following captcha."
+    if success_markers:
+        return sess_id, session
+    if captcha_marker not in first.text:
+        return "-1", session
+
+    main.log("[Captcha Solver] 进行验证码识别，provider=challenge-gateway")
+    candidates = captcha_candidates(captcha_image_url, session, sess_id)
+    for candidate_provider, captcha_code in candidates:
+        main.log(
+            "[Captcha Solver] provider={} candidate={}".format(
+                candidate_provider, captcha_code
+            )
+        )
+        second = session.post(
+            url,
+            headers=headers,
+            data={
+                "subaction": "login",
+                "sess_id": sess_id,
+                "captcha_code": captcha_code,
+            },
+            timeout=30,
+        )
+        second.raise_for_status()
+        if captcha_marker in second.text:
+            main.log(
+                "[Captcha Solver] candidate rejected, trying the next candidate"
+            )
+            continue
+        if (
+            "Hello" in second.text
+            or "Confirm or change your customer data here" in second.text
+        ):
+            main.log("[Captcha Solver] 验证通过")
+            return sess_id, session
+
+        main.log("[EUserv] CAPTCHA passed but the login response was not successful")
+        return "-1", session
+
+    main.log("[Captcha Solver] 所有候选验证码均验证失败")
+    return "-1", session
+
+
+def login_with_retry(username: str, password: str):
+    """Preserve the upstream retry count without the misleading provider log."""
+    max_retry = max(0, int(main.LOGIN_MAX_RETRY_COUNT))
+    for attempt in range(max_retry + 1):
+        if attempt:
+            main.log("[EUserv] Login tried the {}th time".format(attempt + 1))
+        try:
+            sess_id, session = login_once(username, password)
+        except Exception as exc:
+            main.log("[EUserv] Login attempt failed: {}".format(exc))
+            sess_id, session = "-1", None
+        if sess_id != "-1":
+            return sess_id, session
+    return "-1", session
+
+
 def run_job():
-    # main.login is decorated in the bundled module. Its original function
-    # resolves captcha_solver from main's globals, so replace it before use.
+    # Use the session-aware login above instead of the bundled decorated login.
     main.captcha_solver = captcha_solver
+    main.login = login_with_retry
 
     if not main.USERNAME or not main.PASSWORD:
         main.log("[EUserv] 你没有添加任何账户")

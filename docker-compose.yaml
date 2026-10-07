@@ -1,6 +1,6 @@
 services:
   euserv-renew:
-    image: circling0635/euserv-renew:2026.10.02
+    image: circling0635/euserv-renew:2026.10.08
     container_name: euserv-renew
     restart: unless-stopped
     env_file:

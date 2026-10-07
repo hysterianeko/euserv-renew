@@ -19,7 +19,7 @@ the shared `CHALLENGE_GATEWAY_KEY`. Do not commit `config/private.env`.
 项目默认使用已经发布的 Docker Hub 镜像：
 
 ```text
-circling0635/euserv-renew:2026.10.02
+circling0635/euserv-renew:2026.10.08
 ```
 
 镜像只包含程序代码，不包含账号、密码、Mailparser 地址、Telegram Token
@@ -89,9 +89,15 @@ docker compose up -d
 ## CAPTCHA flow
 
 The job downloads the CAPTCHA with the current EUserv `PHPSESSID`, sends the
-image to the gateway using the CapSolver-compatible `ImageToTextTask` API, and
-polls `/getTaskResult` until the OCR result is ready. The session cookie is
-kept for the subsequent EUserv login submission.
+image to the self-hosted gateway using the CapSolver-compatible
+`ImageToTextTask` API, and polls `/getTaskResult` until the OCR result is
+ready. For EUserv, the gateway returns a bounded set of OCR candidates from
+the original image, a noise-reduced image, and the beta OCR model. The client
+tries those candidates on the same EUserv session before starting a new login
+attempt. No third-party CAPTCHA fallback is used in this flow.
+
+The candidate count can be limited with `CAPTCHA_MAX_CANDIDATES` (default `4`)
+and local preprocessing can be disabled with `CAPTCHA_PREPROCESS_ENABLED`.
 
 验证码处理是异步的：先调用 `/createTask` 获取 `taskId`，再轮询
 `/getTaskResult`。这也是为什么不能只把 `CHALLENGE_GATEWAY_URL` 改成一个地址，
