@@ -1,4 +1,6 @@
-FROM ghcr.io/hysterianeko/eu-ex-docker:latest
+# Use the last public runtime image as the base so builds do not require the
+# private GHCR package or a separate packages:read token.
+FROM circling0635/euserv-renew:2026.10.08
 
 USER root
 RUN pip install --no-cache-dir Pillow
