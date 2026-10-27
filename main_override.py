@@ -41,6 +41,18 @@ CAPTCHA_PREPROCESS_ENABLED = (
 CAPTCHA_MAX_CANDIDATES = max(
     1, int(os.environ.get("CAPTCHA_MAX_CANDIDATES", "4"))
 )
+LOGIN_RETRY_BACKOFF_SECONDS = max(
+    1, int(os.environ.get("LOGIN_RETRY_BACKOFF_SECONDS", "30"))
+)
+CAPTCHA_MARKER = "To finish the login process please solve the following captcha."
+
+
+class LoginBlockedError(RuntimeError):
+    """EUserv asked the client to stop because login attempts are blocked."""
+
+
+class LoginResponseError(RuntimeError):
+    """EUserv returned neither a success page nor a CAPTCHA page."""
 
 
 def fetch_captcha(captcha_image_url: str, session, sess_id: str | None = None) -> bytes:
@@ -82,6 +94,8 @@ def preprocess_captcha(image_bytes: bytes) -> bytes:
 
     mask = Image.new("L", image.size)
     mask.putdata(pixels)
+    # For a black-on-white mask, MaxFilter erodes foreground and MinFilter
+    # dilates it: together they form a 3x3 opening.
     opened = mask.filter(ImageFilter.MaxFilter(3)).filter(ImageFilter.MinFilter(3))
     width, height = opened.size
     top = max(0, round(height * 0.14))
@@ -281,11 +295,19 @@ def login_once(username: str, password: str):
         "Hello" in first.text
         or "Confirm or change your customer data here" in first.text
     )
-    captcha_marker = "To finish the login process please solve the following captcha."
     if success_markers:
         return sess_id, session
-    if captcha_marker not in first.text:
-        return "-1", session
+    if CAPTCHA_MARKER not in first.text:
+        response_text = first.text.lower()
+        if "too many login failures" in response_text:
+            raise LoginBlockedError(
+                "EUserv temporarily blocked login attempts (too many failures)."
+            )
+        raise LoginResponseError(
+            "EUserv returned an unexpected login response: "
+            f"status={first.status_code}, bytes={len(first.content)}, "
+            f"content_type={first.headers.get('content-type', '')!r}"
+        )
 
     main.log("[Captcha Solver] 进行验证码识别，provider=challenge-gateway")
     candidates = captcha_candidates(captcha_image_url, session, sess_id)
@@ -306,7 +328,7 @@ def login_once(username: str, password: str):
             timeout=30,
         )
         second.raise_for_status()
-        if captcha_marker in second.text:
+        if CAPTCHA_MARKER in second.text:
             main.log(
                 "[Captcha Solver] candidate rejected, trying the next candidate"
             )
@@ -328,16 +350,27 @@ def login_once(username: str, password: str):
 def login_with_retry(username: str, password: str):
     """Preserve the upstream retry count without the misleading provider log."""
     max_retry = max(0, int(main.LOGIN_MAX_RETRY_COUNT))
+    session = None
     for attempt in range(max_retry + 1):
         if attempt:
             main.log("[EUserv] Login tried the {}th time".format(attempt + 1))
         try:
             sess_id, session = login_once(username, password)
+        except LoginBlockedError as exc:
+            main.log(f"[EUserv] {exc} Stopping retries for this run.")
+            return "-1", None
+        except LoginResponseError as exc:
+            main.log(f"[EUserv] {exc} Stopping retries for this run.")
+            return "-1", None
         except Exception as exc:
             main.log("[EUserv] Login attempt failed: {}".format(exc))
             sess_id, session = "-1", None
         if sess_id != "-1":
             return sess_id, session
+        if attempt < max_retry:
+            delay = min(300, LOGIN_RETRY_BACKOFF_SECONDS * (2**attempt))
+            main.log(f"[EUserv] Waiting {delay}s before the next login attempt.")
+            time.sleep(delay)
     return "-1", session
 
 

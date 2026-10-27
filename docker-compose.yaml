@@ -1,8 +1,8 @@
 services:
   euserv-renew:
-    image: circling0635/euserv-renew:2026.10.08
+    image: circling0635/euserv-renew:2026.10.27
     container_name: euserv-renew
-    restart: unless-stopped
+    restart: always
     env_file:
       - ./config/private.env
     environment:
